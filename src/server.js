@@ -260,14 +260,32 @@ function firstVariant(text, baseUrl) {
 
 /** 媒体列表里**最新**那个分片（滑动窗口里唯一还该存在的）。 */
 function newestSegment(text, baseUrl) {
+  const list = segmentCandidates(text, baseUrl, 1);
+  return list.length ? list[0] : null;
+}
+
+/**
+ * 媒体列表里最后几个分片（最新在前）。
+ *
+ * 为什么需要「不止一个」：预检本来是拿**最新**那个分片去试，试不到就判这条线路死。
+ * 但实测（2026-10-10 22:12）有这类中转源：清单正常，**最新那一片**还没准备好
+ * （返回 404），而倒数第二片好好的。只试最新一片就会把完全能播的线路误判成死线，
+ * 面板上留下「源不可用：分片 HTTP 404」，而播放器只好退到又慢又难解的线路上 ——
+ * 这正是用户看到的「好线路全被标红、最后什么都播不了」。
+ * 所以判死之前，允许往下退一两片再试。
+ */
+function segmentCandidates(text, baseUrl, limit = 3) {
   const segs = [];
   for (const raw of String(text || '').split(/\r?\n/)) {
     const s = raw.trim();
     if (!s || s.startsWith('#')) continue;
     segs.push(s);
   }
-  if (!segs.length) return null;
-  try { return new URL(segs[segs.length - 1], baseUrl).href; } catch (err) { return null; }
+  const out = [];
+  for (let i = segs.length - 1; i >= 0 && out.length < limit; i -= 1) {
+    try { out.push(new URL(segs[i], baseUrl).href); } catch (err) { /* 跳过坏行 */ }
+  }
+  return out;
 }
 
 /**
@@ -281,7 +299,7 @@ function newestSegment(text, baseUrl) {
  * 为什么用「最新分片」而不是第一个：直播滑动窗口里第一条是最旧的、通常已被删除，
  * 拿它判活会把正常线路误判成死线。
  */
-async function preflightHls({ headBytes, headers, finalUrl, ctx }) {
+async function preflightHlsOnce({ headBytes, headers, finalUrl, ctx }) {
   const withTimeout = (p, ms, msg) => Promise.race([
     p,
     new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms)),
@@ -322,27 +340,109 @@ async function preflightHls({ headBytes, headers, finalUrl, ctx }) {
     base = vres.finalUrl || variant;
   }
 
-  const segUrl = newestSegment(text, base);
-  if (!segUrl) return { dead: true, reason: '列表里没有分片' };
+  const candidates = segmentCandidates(text, base, 3);
+  if (!candidates.length) return { dead: true, reason: '列表里没有分片' };
 
-  try {
-    const sres = await withTimeout(stream.openUpstream(segUrl, ctx), 8000, '分片连接超时');
-    const ss = sres.res.statusCode || 200;
-    sres.res.resume();
-    if (ss >= 400) return { dead: true, reason: '分片 HTTP ' + ss, segUrl, segStatus: ss };
-    return { dead: false, segUrl, segStatus: ss };
-  } catch (err) {
-    /*
-     * 只有「明确被拒绝」才判死线。
-     * 超时（ETIMEDOUT / AbortError）和未知网络错误**不算** —— 源抖一下就误杀会
-     * 让本来能播的线路被跳过，代价比多等几秒大得多。
-     */
-    const m = String(err && err.message || '');
-    if (/ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|ENETUNREACH|HTTP 4\d\d|HTTP 5\d\d/i.test(m)) {
-      return { dead: true, reason: '分片连不上：' + m, segUrl };
+  /*
+   * 从最新那片往下退着试（最多 3 片）。
+   * 最新一片 404/403 不等于这条线路死 —— 可能只是它还没准备好，
+   * 或者中转源还没把上游那一片同步过来（见 segmentCandidates 注释）。
+   */
+  let lastReason = '';
+  let lastSeg = candidates[0];
+  for (const segUrl of candidates) {
+    lastSeg = segUrl;
+    try {
+      const sres = await withTimeout(stream.openUpstream(segUrl, ctx), 8000, '分片连接超时');
+      const ss = sres.res.statusCode || 200;
+      sres.res.resume();
+      /*
+       * 403 / 429 是「拒绝访问 / 被限流」，**不等于这一片不存在** ——
+       * 实测（2026-10-10 22:14）线路四那条 192.168.1.10:19105 中转源：
+       * 预检报 403，而同一时刻用普通 GET、带 Range 的 GET、甚至 6 个并发请求
+       * 直接打它最新那片，全是 206/200。也就是说这个 403 是**一时一地**的，
+       * 而按死线处理会把一条完全能播的线路标红（面板上那句「源不可用：分片 HTTP 403」）。
+       * 所以：403/429 按「不确定」放行，让播放去决定；404/410 才是真没了。
+       */
+      if (ss === 403 || ss === 429) {
+        return { dead: false, segUrl, segStatus: ss, note: '分片被拒（HTTP ' + ss + '），按不确定处理' };
+      }
+      if (ss >= 400) { lastReason = '分片 HTTP ' + ss; continue; }
+      return { dead: false, segUrl, segStatus: ss, tried: candidates.indexOf(segUrl) + 1 };
+    } catch (err) {
+      const m = String(err && err.message || '');
+      if (/ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|ENETUNREACH|HTTP 4\d\d|HTTP 5\d\d/i.test(m)) {
+        lastReason = '分片连不上：' + m;
+        continue;
+      }
+      // 超时/未知网络错误：按「不确定」处理，不判死线
+      return { dead: false, segUrl, note: '分片探测不确定（' + m + '），不判死线' };
     }
-    return { dead: false, segUrl, note: '分片探测不确定（' + m + '），不判死线' };
   }
+  return { dead: true, reason: lastReason || '分片不可用', segUrl: lastSeg };
+}
+
+/**
+ * 判死之前**再采一次样**。
+ *
+ * 起因（2026-10-10 用户截图）：CCTV5 的线路三被判「源不可用：列表里没有分片」，
+ * 而几秒后我用同一个预检接口重跑，10 条线路全部是活的。
+ * 直播源的播放列表在换窗口 / 上游重推的那一瞬间确实可能是空的，
+ * 单次采样判死就会把好线路标成红的 —— 而且面板会显示「已失败」、这条线
+ * 在这一轮里再也不会被尝试。PotPlayer / ok影视 不会被这种一瞬抖动骗到，
+ * 我们也不该。
+ *
+ * 只有「可能只是一时抖动」的原因才复测：空列表、4xx/5xx、明确拒连。
+ * 复测仍判死才真判死；复测通过就按活线返回，并留下 note 便于排查。
+ */
+const PREFLIGHT_RETRYABLE = /列表里没有分片|主列表里没有变体|HTTP 4\d\d|HTTP 5\d\d|连不上/;
+
+async function preflightHls(opts) {
+  const first = await preflightHlsOnce(opts);
+  if (!first || !first.dead || !PREFLIGHT_RETRYABLE.test(String(first.reason || ''))) return first;
+  await new Promise((r) => setTimeout(r, 700));
+  try {
+    const again = await preflightHlsOnce(opts);
+    if (again && !again.dead) {
+      return Object.assign({}, again, { note: `首测判死（${first.reason}），复测通过` });
+    }
+    return again || first;
+  } catch (err) {
+    // 复测本身出错：按「不确定」处理，不判死线（和 1.6.5 的取向一致）
+    return { dead: false, note: `复测出错（${err.message}），不判死线` };
+  }
+}
+
+/**
+ * 把 fMP4 init 片段里 avcC 的 profile_compatibility 低位清零。
+ *
+ * 起因（2026-10-10 深夜，实测三次）：CCTV1 / CCTV13 线路一这类源，H.264 的 SPS 里
+ * `reserved_zero_2bits = 1`（H.264 规定这两位必须为 0，编码器写错了）。
+ * ffmpeg 用 `-c:v copy` 时会把 SPS 原样抄进 avcC，于是浏览器拿到的编码串是
+ * `avc1.640128`；而 Chromium 的 MSE 解析器**校验这两位**，直接拒收：
+ *
+ *   Failed to execute 'addSourceBuffer': The type provided
+ *   ('video/mp4;codecs=mp4a.40.2,avc1.640128') is unsupported
+ *
+ * 同一个串把第二位换成 00（`avc1.640028`）就 true —— 差别只在这 2 个保留位。
+ * ffmpeg 自己的 h264_metadata 位流过滤器也因为这个非法值报
+ * 「reserved_zero_2bits out of range: 1, but must be in [0,0]」而无法工作。
+ *
+ * 所以最省事、也最正确的做法是：**服务端吐 init 片段时把这两位清掉**。
+ * 它不改变任何视频数据（这两位是保留位），只是把编码器的错修正回规范值；
+ * 实测清掉之后，`-c:v copy` 的产物（不转码！）在浏览器里 errs=[] 正常播放。
+ *
+ * avcC 布局：['avcC'][version(1)][profile(1)][profile_compatibility(1)][level(1)]…
+ * 所以从 'avcC' 起 +6 就是 profile_compatibility。
+ */
+function sanitizeInitSegment(buf) {
+  const idx = buf.indexOf('avcC');
+  if (idx < 0 || idx + 7 >= buf.length) return buf;
+  const compat = idx + 6;
+  if ((buf[compat] & 0x03) === 0) return buf;   // 保留位本来就是 0，不用动
+  const out = Buffer.from(buf);
+  out[compat] = out[compat] & 0xFC;
+  return out;
 }
 
 class LocalServer {
@@ -1028,6 +1128,10 @@ class LocalServer {
         ref: String(payload.ref || ''),
         ua: String(payload.ua || ''),
         name: String(payload.name || ''),
+        // 'transcode' = 连视频一起重编（源的 H.264 参数浏览器不认时用；见 local.js）
+        videoMode: String(payload.video || ''),
+        // 客户端能力（前端用 mediaCapabilities 探到的）：目前只用一样 —— HEVC 能不能直解
+        caps: payload.caps && typeof payload.caps === 'object' ? payload.caps : null,
       });
       /*
        * ⚠️ **立刻**把 ffmpeg 拉起来，不要等别人来请求播放列表。
@@ -1097,7 +1201,7 @@ class LocalServer {
     const failed = [];
     for (const file of paths) {
       try {
-        const s = await local.openFile(String(file));
+        const s = await local.openFile(String(file), payload.caps && typeof payload.caps === 'object' ? payload.caps : null);
         opened.push({
           id: s.id,
           name: s.name,
@@ -1135,11 +1239,16 @@ class LocalServer {
     const range = req.headers.range;
 
     if (!range) {
+      // 客户端已断开就别开读流：读流没人消费就不会走到 'end'，fd 会一直挂着
+      if (res.destroyed || res.writableEnded) return;
       res.writeHead(200, {
         'Content-Type': type, 'Content-Length': total,
         'Accept-Ranges': 'bytes', 'Cache-Control': 'no-store',
       });
-      fs.createReadStream(session.file).pipe(res);
+      const stream = fs.createReadStream(session.file);
+      res.on('close', () => stream.destroy());
+      stream.on('error', () => res.destroy());
+      stream.pipe(res);
       return;
     }
 
@@ -1153,6 +1262,7 @@ class LocalServer {
       res.end();
       return;
     }
+    if (res.destroyed || res.writableEnded) return;
     res.writeHead(206, {
       'Content-Type': type,
       'Content-Length': end - start + 1,
@@ -1190,18 +1300,73 @@ class LocalServer {
       try {
         const stat = await fsp.stat(target);
         if (stat.size > 0) {
+          /*
+           * ⚠️ 走到这里时，发起请求的客户端**可能早就断了**。
+           *
+           * 上面这个循环最长等 25 秒，而播放器读列表用的是「fetch + 2~3 秒
+           * AbortController 超时」（见 renderer/app.js 的 readPlaylist）——
+           * 文件写出来的那一刻，那几个请求往往已经被自己中止了。
+           *
+           * 实测（2026-10-10 21:16 / 21:18 两轮）：对已经断开的响应写字，读流
+           * 既没有消费者、也永远走不到 'end'，fd 就再也关不掉。而 ffmpeg 每写一次
+           * 播放列表都是「写 index.m3u8.tmp → 改名成 index.m3u8」，Windows 只要
+           * 目标文件被任何句柄占住就改名失败（libuv 的读句柄不带 FILE_SHARE_DELETE，
+           * 已用 MoveFileEx 单独验证）。ffmpeg 对此只留一句 warning，
+           * 而这里 ffmpeg 是 -loglevel error，于是：
+           *   「列表永远停在第一个分片，分片其实一直在产出」
+           * ——界面上就是「正在起播（已就绪 0 / 20 秒）」无休止地转圈。
+           *
+           * 三条对策：
+           *   ① 客户端走了就直接 return，绝不碰文件；
+           *   ② 播放列表整份读进内存再回包，读句柄的生命周期与客户端彻底解耦；
+           *   ③ 分片仍然流式发，但 res 一关就把读流销毁掉（句柄必然归还）。
+           */
+          if (res.destroyed || res.writableEnded) return;
+          const type = name.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl'
+            : name.endsWith('.ts') ? 'video/mp2t'
+            // fMP4 分片（.m4s / init.mp4）：必须给 video/mp4，否则 hls.js 拿到的
+            // Content-Type 是 octet-stream，某些路径下会影响 MSE 建源缓冲
+            : (name.endsWith('.m4s') || name.endsWith('.mp4')) ? 'video/mp4'
+            : 'application/octet-stream';
+          /*
+           * init 片段要过一道「保留位清零」——见 sanitizeInitSegment 的注释。
+           * 这个文件只有一两 KB，整份读进来改完再发最稳（也顺带不占着文件句柄）。
+           */
+          if (name === 'init.mp4') {
+            const buf = sanitizeInitSegment(await fsp.readFile(target));
+            if (res.destroyed || res.writableEnded) return;
+            res.writeHead(200, {
+              'Content-Type': 'video/mp4',
+              'Content-Length': buf.length,
+              'Access-Control-Allow-Origin': '*',
+              'Cache-Control': 'no-store',
+            });
+            res.end(buf);
+            return;
+          }
+          if (name.endsWith('.m3u8')) {
+            const buf = await fsp.readFile(target);
+            // 读的这几毫秒里客户端也可能断，回包前再确认一次
+            if (res.destroyed || res.writableEnded) return;
+            res.writeHead(200, {
+              'Content-Type': type,
+              'Content-Length': buf.length,
+              'Access-Control-Allow-Origin': '*',
+              'Cache-Control': 'no-store',
+            });
+            res.end(buf);
+            return;
+          }
           res.writeHead(200, {
-            'Content-Type': name.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl'
-              : name.endsWith('.ts') ? 'video/mp2t'
-              // fMP4 分片（.m4s / init.mp4）：必须给 video/mp4，否则 hls.js 拿到的
-              // Content-Type 是 octet-stream，某些路径下会影响 MSE 建源缓冲
-              : (name.endsWith('.m4s') || name.endsWith('.mp4')) ? 'video/mp4'
-              : 'application/octet-stream',
+            'Content-Type': type,
             'Content-Length': stat.size,
             'Access-Control-Allow-Origin': '*',
             'Cache-Control': 'no-store',
           });
-          fs.createReadStream(target).pipe(res);
+          const stream = fs.createReadStream(target);
+          res.on('close', () => stream.destroy());
+          stream.on('error', () => res.destroy());
+          stream.pipe(res);
           return;
         }
       } catch (err) {

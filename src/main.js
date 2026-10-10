@@ -6,6 +6,7 @@
 
 const path = require('path');
 const fs = require('fs');
+const { spawn } = require('child_process');
 const { app, BrowserWindow, shell, Menu, ipcMain, nativeImage, dialog } = require('electron');
 
 const { LocalServer } = require('./server');
@@ -158,6 +159,23 @@ function buildMenu() {
                 `数据目录：${app.getPath('userData')}\n\n` +
                 '面向 iptv-hub 的桌面 IPTV 播放器。\n' +
                 '内置 ffmpeg 兜底：Chromium 解不了的源（MPEG-2 / MP2 / HEVC / AC-3 等）自动转码播放。\n' +
+                '1.6.7：修转码播放列表被句柄占住导致「一直转圈不开播」（详见 PATCH-NOTES-1.6.7.md）。\n' +
+                '1.6.8：编码不支持改走 ffmpeg 接管；线路预检判死前复测一次（详见 PATCH-NOTES-1.6.8.md）。\n' +
+                '1.6.9：前向缓冲见底改为「先等」，不再频繁重建 MediaSource（详见 PATCH-NOTES-1.6.9.md）。\n' +
+                '1.6.10：ffmpeg 放宽分片扩展名检查；分片 4xx 不再判死整条线路。\n' +
+                '1.6.11：修 ffprobe 吃了 ffmpeg 专有选项导致编码探测长期失效。\n' +
+                '1.6.12：音频一律重编 AAC（修 ADTS AAC 直通 fMP4 必失败）。\n' +
+                '1.6.13：源的 H.264 参数浏览器不认时自动改走视频重编（修 avc1.640128 这类被 MSE 拒收）。\n' +
+                '1.6.14：预检判死前会往下退分片再试，不再因「最新一片没准备好」误杀好线路。\n' +
+                '1.6.15：分片 403/429 按「不确定」放行；播放侧 4xx 跳不动时正常换线。\n' +
+                '1.6.16：编解码接管按播放令牌上锁，修「刚建好的会话被迟到报错连拆两次」。\n' +
+                '1.6.17：hls.js 实例加序号，旧实例的迟到事件一律作废；画面在动时无条件收起旧错误面板。\n' +
+                '1.6.18：记住「这条源要重编视频」；换壳档 15 秒不出画自动改重编。\n' +
+                '1.6.19：新增「用外部播放器打开」（PotPlayer / VLC / mpv 自动识别）。\n' +
+                '1.6.23：HEVC 能硬解就直通不转码；转码档解码交给 GPU（-hwaccel auto，失败自动回退）。\n' +
+                '1.6.24：修源 SPS 保留位导致的 avc1.640128 拒收 —— 清掉 init 里的保留位，免转码直通。\n' +
+                '1.6.25：换壳分片被拒收（分片内嵌非法 SPS）时自动升级为重编，并记住这条源。\n' +
+                '1.6.26/27：慢源（<1x 实时）改为「立刻从最早一片开播 + 不追直播」。\n' +
                 '本程序只做地址聚合与播放，不转播、不缓存任何媒体流。',
               buttons: ['好'],
             });
@@ -311,6 +329,84 @@ ipcMain.handle('app:fullscreen', () => {
   const next = !mainWindow.isFullScreen();
   mainWindow.setFullScreen(next);
   return next;
+});
+
+/*
+ * ---------------------------------------------------------------- 外挂播放器
+ *
+ * 「播不了就切给别的播放器」（用户 2026-10-10 的要求）。
+ *
+ * 为什么需要：Chromium 的 MSE 有一批它就是不收的东西 —— MP2 / MPEG-2 没有解码器；
+ * 源的 H.264 SPS 带了它不认的 constraint 位（实测 avc1.640128 → isTypeSupported=false，
+ * 而 avc1.640028 = true，差别只在第二个字节）；分片地址没有扩展名还会被 ffmpeg 的
+ * 默认白名单挡一次。内置 ffmpeg 兜底能解决绝大多数，代价是起播要重编、吃 CPU；
+ * 而 VLC / PotPlayer / mpv 自带 libavcodec，同一路流它们直接就能播。
+ *
+ * 播放器路径：优先环境变量 HUBPLAY_EXTERNAL_PLAYER，其次按常见安装位置自动找。
+ */
+const EXTERNAL_PLAYER_CANDIDATES = [
+  'C:\\Program Files\\DAUM\\PotPlayer\\PotPlayerMini64.exe',
+  'C:\\Program Files (x86)\\DAUM\\PotPlayer\\PotPlayerMini.exe',
+  'C:\\Program Files\\VideoLAN\\VLC\\vlc.exe',
+  'C:\\Program Files (x86)\\VideoLAN\\VLC\\vlc.exe',
+  'C:\\Program Files\\mpv\\mpv.exe',
+  'C:\\Program Files (x86)\\mpv\\mpv.exe',
+];
+
+function findExternalPlayer() {
+  const fromEnv = process.env.HUBPLAY_EXTERNAL_PLAYER;
+  if (fromEnv && fs.existsSync(fromEnv)) return fromEnv;
+  for (const p of EXTERNAL_PLAYER_CANDIDATES) {
+    try { if (fs.existsSync(p)) return p; } catch (err) { /* ignore */ }
+  }
+  return '';
+}
+
+ipcMain.handle('app:external-player', () => ({ ok: true, player: findExternalPlayer() }));
+
+ipcMain.handle('app:play-external', (_event, payload) => {
+  const p = payload && typeof payload === 'object' ? payload : { url: payload };
+  const url = String(p.url || '');
+  const ref = String(p.ref || '');
+  const ua = String(p.ua || '');
+  if (!/^(https?|rtsp|rtmp|rtp|udp):\/\//i.test(url)) return { ok: false, reason: '地址不合法' };
+  const player = findExternalPlayer();
+  if (!player) {
+    return { ok: false, reason: '没找到外部播放器。可设环境变量 HUBPLAY_EXTERNAL_PLAYER 指向 PotPlayer / VLC / mpv' };
+  }
+  /*
+   * 防盗链请求头能带就带。
+   *
+   * 用户给的资料里有一条很关键：**PotPlayer 原生不支持自定义 User-Agent / Referer**，
+   * 遇到防盗链的源只能靠代理或 ffmpeg 包装 —— 而 HubPlay 的 ffmpeg 通路本来就带
+   * （networkInputArgs 里的 -headers）。所以交给外部播放器时也不能白丢：
+   *   · VLC：--http-referrer / --http-user-agent
+   *   · mpv：--http-header-fields="Referer: ...,User-Agent: ..."（选项要放在地址前）
+   *   · PotPlayer：没有对应开关，只能照原样丢地址，并把「没带请求头」如实告诉用户
+   */
+  const low = player.toLowerCase();
+  const args = [];
+  let headersForwarded = 0;
+  if (low.includes('vlc')) {
+    if (ref) { args.push('--http-referrer=' + ref); headersForwarded += 1; }
+    if (ua) { args.push('--http-user-agent=' + ua); headersForwarded += 1; }
+    args.push(url);
+  } else if (low.includes('mpv')) {
+    const fields = [];
+    if (ref) fields.push('Referer: ' + ref);
+    if (ua) fields.push('User-Agent: ' + ua);
+    if (fields.length) { args.push('--http-header-fields=' + fields.join(',')); headersForwarded = fields.length; }
+    args.push(url);
+  } else {
+    args.push(url);
+  }
+  try {
+    const child = spawn(player, args, { detached: true, stdio: 'ignore' });
+    child.unref();
+    return { ok: true, player, headersForwarded, canForwardHeaders: low.includes('vlc') || low.includes('mpv') };
+  } catch (err) {
+    return { ok: false, reason: String((err && err.message) || err) };
+  }
 });
 
 ipcMain.handle('app:open-external', (_event, url) => {

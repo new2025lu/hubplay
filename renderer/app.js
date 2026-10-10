@@ -10,6 +10,17 @@ const $ = (id) => document.getElementById(id);
 
 const video = $('video');
 
+/*
+ * 记住「哪些源地址必须重编视频」。
+ *
+ * 起因（2026-10-10 22:18，CCTV13 线路一）：那条源的 H.264 SPS 带了 MSE 不认的
+ * constraint 位，`-c:v copy` 出来的分片浏览器建不了 SourceBuffer，必须先换壳试一次、
+ * 被拒了再改成重编 —— 而「被拒」这个信号偶尔收不到（旧实例事件被丢弃 / hls.js 没抛错），
+ * 于是一路转圈。这里把结论按 URL 记下来：**同一条源以后第一次就直接用重编档**，
+ * 不再依赖那次失败能被及时发现。
+ */
+const TRANSCODE_URLS = new Set();
+
 const state = {
   channels: [],
   groups: [],
@@ -63,6 +74,11 @@ const state = {
   wantFfmpeg: false,     // 本次播放已判定「Chromium 解不了」，直接走 ffmpeg 转码
   ffmpegTried: false,    // ffmpeg 兜底是否已尝试过（避免反复起进程）
   ffmpegFallback: false, // 当前是否正由 ffmpeg 接管
+  ffmpegVideoMode: 'copy', // ffmpeg 侧视频处理方式：copy（换壳）/ transcode（重编，源 SPS 浏览器不认时用）
+  ffmpegHandoffAt: 0,       // 上次把播放交给 ffmpeg 的时刻 —— 只用来给「迟到报错」做限时防抖
+  transcodeRetryAt: 0,      // 「换壳档未出画 → 改重编」只做一次的时间戳
+  lastTriedUrl: '',         // 最后尝试过的线路地址（交给外部播放器用）
+  hlsSeq: 0,                // hls.js 实例序号：销毁/新建都自增，用来丢弃**旧实例**排队里的迟到事件
   lastFailReason: '',    // 最后一次失败原因（兜底时提示用）
   healthTimer: null,     // 转码期间的会话体检轮询
   remuxSid: null,        // 当前 ffmpeg 接管会话 id（换线路/换台时先关掉它，别让旧 ffmpeg 挂着跑）
@@ -289,15 +305,46 @@ function setSpinner(on, text) {
  */
 function showError(title, body, retryable) {
   $('errorTitle').textContent = title;
-  const btn = retryable
-    ? '<div class="error-actions"><button id="btnRetryLine" class="btn btn-primary">重试这个频道</button></div>'
-    : '';
+  /*
+   * 「用外部播放器打开」——Chromium 的 MSE 有一批它就是不收的流（MP2 / MPEG-2 没解码器、
+   * 源的 H.264 SPS 带了它不认的 constraint 位、分片地址没有扩展名…）。
+   * 内置 ffmpeg 兜底能解决绝大多数，但遇到它也放不出来的时候，本机装的
+   * PotPlayer / VLC / mpv 自带 libavcodec，同一路流它们直接就能播 —— 一键交出去。
+   */
+  const url = state.currentLine >= 0 && state.lines[state.currentLine]
+    ? state.lines[state.currentLine].url
+    : (state.lastTriedUrl || '');
+  const actions = [];
+  if (retryable) actions.push('<button id="btnRetryLine" class="btn btn-primary">重试这个频道</button>');
+  if (url) actions.push('<button id="btnExternalPlayer" class="btn">用外部播放器打开</button>');
+  const btn = actions.length ? `<div class="error-actions">${actions.join('')}</div>` : '';
   $('errorBody').innerHTML = body + btn;
   $('errorBox').classList.remove('hidden');
   const rb = $('btnRetryLine');
   if (rb) {
     rb.addEventListener('click', () => {
       if (state.currentId >= 0) playChannel(state.currentId);
+    });
+  }
+  const eb = $('btnExternalPlayer');
+  if (eb) {
+    eb.addEventListener('click', async () => {
+      const api = window.hubplay || {};
+      if (typeof api.playExternal !== 'function') { toast('这个构建没有外挂播放器通道', true); return; }
+      const line0 = state.currentLine >= 0 ? state.lines[state.currentLine] : null;
+      const r = await api.playExternal({
+        url: (line0 && line0.url) || state.lastTriedUrl || '',
+        ref: (line0 && line0.ref) || '',
+        ua: (line0 && line0.ua) || '',
+      });
+      if (r && r.ok) {
+        let msg = '已交给 ' + String(r.player || '').split('\\').pop();
+        if (r.headersForwarded) msg += '（带上了防盗链请求头）';
+        else if (!r.canForwardHeaders) msg += '（该播放器不支持自定义 UA/Referer，防盗链源可能打不开）';
+        toast(msg);
+      } else {
+        toast('外部播放器打不开：' + ((r && r.reason) || '未知原因'), true);
+      }
     });
   }
 }
@@ -658,7 +705,7 @@ async function openLocalPaths(paths) {
     const r = await fetch('/api/local/open', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ paths: list }),
+      body: JSON.stringify({ paths: list, caps: capsForServer() }),
     });
     const d = await r.json();
     if (!d.ok) throw new Error(d.error || '打开失败');
@@ -1555,8 +1602,18 @@ async function attachHlsHls(url, { token, name, kindLabel }) {
      * ffmpeg 几秒就能产出 20 秒内容，多等 2~4 秒就能一开播就带 10 秒以上缓冲，
      * 那次塌陷根本不会发生。
      */
-    const need = 10;
-    const deadline = Date.now() + 12000;
+    /*
+     * 起播门槛：**3 片（6 秒）就开播，最多等 8 秒**（2026-10-10 深夜从 10 片/12 秒降下来）。
+     *
+     * 旧值是为「源比实时快（1.35×）」那类源调的；可有些 MP2 频道的源实测只有
+     * **0.76× 实时**（2 秒内容要 2.6 秒才吐出来）——对它来说，等满 10 片（20 秒）
+     * 等于先干等 20~30 秒，开播时手里又只有 8 秒余量，于是每几十秒就见底一次。
+     * 用户的原话就是「需要转码的都播放不了」。
+     *
+     * 现在改成「手里有一点就开播」，剩下的缓冲让它在播放中自然长起来。
+     */
+    const need = 3;
+    const deadline = Date.now() + 8000;
     let lastLogged = -1;
     while (listSegs < need && Date.now() < deadline) {
       if (state.playToken !== token) return;
@@ -1604,12 +1661,23 @@ async function attachHlsHls(url, { token, name, kindLabel }) {
    * 加载上限就变成 边缘 + 112 秒 —— 源端只要还在 1.35× 生产，缓冲就一路涨，
    * 攒出来的余量足以吃掉后面所有停顿，而且越看越稳。
    */
-  const ffmpegLatencySegments = 4;    // 4 × 2 秒 = 8 秒（贴近直播，起播快）
-  plan.liveSyncDurationCount = ffmpegLatencySegments;
-  plan.targetLatency = ffmpegLatencySegments * FFMPEG_HLS_SEGMENT_SECONDS;
+  /*
+   * ⚡ 起播位置 = **手里已有的最早那一片**（2026-10-10 深夜翻过来）。
+   *
+   * 旧策略是「站在离直播边缘 4 片（8 秒）处起播」——那适合"源比实时快"的源。
+   * 但对 0.76× 实时的慢源，它等于把唯一的余量扔掉：开播瞬间前向缓冲只有 8 秒，
+   * 而源每 2.6 秒才吐 2 秒内容，几十秒后必然见底。
+   *
+   * PotPlayer / mpv 遇到这种源的做法简单得多：**立刻从手里已有的最早一片开播**，
+   * 落后就落后，绝不往前跳。这样开播时前向缓冲 = 已发布的整个窗口（十几到几十秒），
+   * 源慢只是慢慢把这笔余量吃回去，观感上就是"一直在播"。
+   */
+  const startBehindSegs = Math.max(2, Math.min(listSegs || 2, 60));
+  plan.liveSyncDurationCount = startBehindSegs;
+  plan.targetLatency = startBehindSegs * FFMPEG_HLS_SEGMENT_SECONDS;
   plan.maxBufferLength = 120;         // 让缓冲有地方涨
   plan.maxMaxBufferLength = 120;
-  plan.backBufferLength = 30;
+  plan.backBufferLength = 60;         // 落后时也别把已播的丢掉（回看/重挂要能取回）
   /*
    * 关键：**不再"追直播"**。
    *
@@ -1626,8 +1694,14 @@ async function attachHlsHls(url, { token, name, kindLabel }) {
    * 既不会因为它频繁把播放头拽回边缘，也不会把 hls.js 内部的缓冲算术撑爆
    * （Infinity 会让 maxLatency 变成 NaN，hls.js 会退化成「只缓 2 秒」）。
    */
-  plan.liveMaxLatencyDurationCount = 20;
-  plan.maxLiveSyncPlaybackRate = 1.05;
+  /*
+   * 纠偏阈值给**很大**、追速给 1 —— 慢源上"落后"是常态，不是错误。
+   * 以前是 20 片（40 秒）+ 1.05 倍速：落后超过 40 秒就把播放头往前拽，
+   * 而慢源必然落后，于是被反复拽回边缘、反复见底（这正是"转码档老卡"的来源之一）。
+   */
+  plan.liveMaxLatencyDurationCount = 3600;
+  plan.maxLiveSyncPlaybackRate = 1;
+  const mySeq = ++state.hlsSeq;
   diagPush('hls-ffmpeg', `直播方案：退 ${plan.targetLatency}s / 前向 ${plan.maxBufferLength}s ` +
     `（按已知窗口 ${plan.windowSeconds}s = ${FFMPEG_HLS_LIST_SIZE} 片 × ${FFMPEG_HLS_SEGMENT_SECONDS}s 算；` +
     `当前列表 ${listSegs === null ? '未取到' : listSegs + ' 片'}）`, 'ok');
@@ -1642,11 +1716,52 @@ async function attachHlsHls(url, { token, name, kindLabel }) {
     fragLoadingRetryDelay: 1000,
   }, plan));
   hls.on(window.Hls.Events.ERROR, (_evt, data) => {
+    // 旧实例（已被 destroyPlayer 换掉）的迟到事件一律忽略
+    if (state.hlsSeq !== mySeq) return;
     diagPush('hls-ffmpeg', `ERROR ${data.type || ''}/${data.details || ''} fatal=${!!data.fatal}` +
       `${data.response ? ' status=' + data.response.code : ''}${data.reason ? ' reason=' + data.reason : ''}`,
     data.fatal ? 'err' : 'warn');
     if (state.playToken !== token || !data.fatal) return;
     if (data.details === 'manifestLoadError' || data.details === 'levelLoadError') return;
+
+    /*
+     * 我们自己产的 fMP4 也可能被浏览器拒收 —— 那**不是**转码失败，而是
+     * 源的 H.264 码流带着 MSE 不认的 profile/constraint 位。
+     *
+     * 实测（2026-10-10 22:08）：线路一那种源，SPS 的 constraint 字节是 0x01，
+     * 浏览器报的 mime 是 `video/mp4;codecs=mp4a.40.2,avc1.640128`，而
+     *   MediaSource.isTypeSupported('video/mp4;codecs="avc1.640128"')  === false
+     *   MediaSource.isTypeSupported('video/mp4;codecs="avc1.640028"')  === true
+     * 差别只在第二个字节。`-c:v copy` 会把这个 SPS 原样搬出来，于是 ffmpeg
+     * 做得再对，addSourceBuffer 照样抛 NotSupportedError。
+     * 而 VLC / PotPlayer 不用 MSE，自然没这回事 —— 这就是同一个源「它们能播、
+     * 我们播不了」的最后一道差别。
+     *
+     * 出路：让 ffmpeg 真编一遍（libx264 产出的 SPS 是浏览器认的那种），重试一次。
+     */
+    if (/bufferAddCodecError|bufferIncompatibleCodecsError/i.test(String(data.details || ''))) {
+      if (state.ffmpegVideoMode !== 'transcode' && state.playToken === token) {
+        state.ffmpegVideoMode = 'transcode';
+        // 记到全局：同一条源以后第一次就直接重编，不再等这次失败被发现
+        try {
+          const curLine = state.lines[state.currentLine];
+          if (curLine && curLine.url) TRANSCODE_URLS.add(curLine.url);
+        } catch (err) { /* ignore */ }
+        diagPush('hls-ffmpeg', `浏览器拒收这条码流（${data.details}${data.mimeType ? ' ' + data.mimeType : ''}）：` +
+          '源的 H.264 参数 MSE 不认，改成重编视频再试', 'warn');
+        toastThrottled('这条源的 H.264 参数浏览器不认，正在重编视频（多花一点 CPU）…');
+        // 它其实能播（只是要换重编档）：把「已失败」标记清掉，别让面板一直红着
+        if (state.currentLine >= 0) {
+          state.failures.delete(state.currentLine);
+          state.failReasons.delete(state.currentLine);
+          renderLinePanel();
+        }
+        const prefer = state.currentLine >= 0 ? state.currentLine : undefined;
+        tryFfmpegFallback('浏览器不认源的 H.264 参数（需重编视频）', prefer, { video: 'transcode' })
+          .catch(() => {});
+        return;
+      }
+    }
 
     /*
      * append / 缓冲类致命错误**先自愈，别急着报「播放失败」**。
@@ -1676,6 +1791,30 @@ async function attachHlsHls(url, { token, name, kindLabel }) {
         return;
       }
       diagPush('hls-ffmpeg', `append 连续失败 ${appendFails} 次，放弃自愈`, 'err');
+      /*
+       * 换壳档的分片被浏览器拒收（实测 2026-10-10 22:42，CCTV1 线路一：
+       * `CHUNK_DEMUXER_ERROR_APPEND_FAILED: Failed to prepare video sample for decode`）——
+       * 因为分片里**还内嵌着那个非法 SPS**（reserved_zero_2bits=1）。
+       * init 片段里的 avcC 我们能在服务端修（1.6.24），分片里内嵌的参数集修不了，
+       * 所以这条源在换壳档下永远播不了：唯一出路是**真编一遍**（libx264 的 SPS 规范），
+       * 并把结论记进 TRANSCODE_URLS —— 下次直接上重编档，不再白试一轮。
+       */
+      if (state.ffmpegVideoMode !== 'transcode') {
+        state.ffmpegVideoMode = 'transcode';
+        const curLine = state.lines[state.currentLine];
+        if (curLine && curLine.url) TRANSCODE_URLS.add(curLine.url);
+        diagPush('hls-ffmpeg', '换壳分片被浏览器拒收：改走视频重编重试（这条源以后直接用重编档）', 'warn');
+        toastThrottled('这条源的分片浏览器解不了，正在改成重编（多花一点 CPU）…');
+        // 它其实能播（只是要换重编档）：把「已失败」标记清掉，别让面板一直红着
+        if (state.currentLine >= 0) {
+          state.failures.delete(state.currentLine);
+          state.failReasons.delete(state.currentLine);
+          renderLinePanel();
+        }
+        tryFfmpegFallback('换壳分片被拒收（需重编视频）',
+          state.currentLine >= 0 ? state.currentLine : undefined, { video: 'transcode' }).catch(() => {});
+        return;
+      }
     }
 
     setSpinner(false);
@@ -1720,7 +1859,19 @@ async function attachHlsHls(url, { token, name, kindLabel }) {
  * 输出 H.264+AAC 的 HLS。等价于把 MPV/VLC 的解码能力搬进应用里，
  * 而不是像 IPTVnator 那样把流甩给外部播放器。
  */
-async function tryFfmpegFallback(failedReason, preferIndex) {
+/**
+ * 把浏览器实测到的解码能力告诉服务端。
+ *
+ * 目前只用一样：**HEVC 能不能直解**。这个包里的 Chromium 在 Windows 上要拿到平台
+ * HEVC 硬解才支持（启动时用 mediaCapabilities 探过一次，结果在 state.decodeCap），
+ * 支持的话服务端就不该把 HEVC 一律判成「要转码」。
+ */
+function capsForServer() {
+  const cap = state.decodeCap && state.decodeCap.hevc_1080;
+  return { hevc: !!(cap && cap.supported) };
+}
+
+async function tryFfmpegFallback(failedReason, preferIndex, opts) {
   /*
    * 挑一条线路交给 ffmpeg。
    *
@@ -1801,6 +1952,13 @@ async function tryFfmpegFallback(failedReason, preferIndex) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         url: best.line.url, ref: best.line.ref, ua: best.line.ua, name: channelName,
+        /*
+         * 'transcode' = 连视频一起重编（源 H.264 的 SPS 浏览器不认时唯一出路）。
+         * 判断顺序：调用方显式指定 > 本次播放已经判定要重编 > 这条源以前被拒过 > 先换壳试。
+         */
+        video: (opts && opts.video) === 'transcode' || state.ffmpegVideoMode === 'transcode'
+          || TRANSCODE_URLS.has(best.line.url) ? 'transcode' : 'copy',
+        caps: capsForServer(),
       }),
     });
     const d = await r.json();
@@ -1927,9 +2085,14 @@ function startHealthCheck(sid, token, channelName) {
         const ac = lv.audioCodec || '';
         levelInfo = ` hls编码=${vc || '?'}${ac ? '/' + ac : ''}`;
       }
-      diagPush('ffmpeg-status', `rs=${video.readyState} 分片=${s.segments} seq=${s.mediaSequence} ` +
+      const listAge = (typeof s.playlistAgeMs === 'number')
+        ? `${Math.round(s.playlistAgeMs / 1000)}s前` : '无';
+      // 分片在涨、列表却停更 = ffmpeg 改名失败（详见 server.js handleLocalHls 注释）
+      const listStalled = typeof s.playlistAgeMs === 'number' && s.playlistAgeMs > 20000
+        && s.started && !s.finished;
+      diagPush('ffmpeg-status', `rs=${video.readyState} 分片=${s.segments} seq=${s.mediaSequence} 列表更新=${listAge} ` +
         `started=${s.started} finished=${s.finished} exit=${s.exitCode} err=${s.error || '无'}${levelInfo}`,
-      s.error ? 'err' : '');
+      (s.error || listStalled) ? (s.error ? 'err' : 'warn') : '');
       if (s.error || (s.finished && s.segments === 0)) {
         stopHealthCheck();
         setSpinner(false);
@@ -1942,6 +2105,29 @@ function startHealthCheck(sid, token, channelName) {
       } else if (s.finished && s.segments > 0) {
         stopHealthCheck();
         toastThrottled('ffmpeg 已结束（上游可能掐断了流），正在自动恢复…');
+      }
+
+      /*
+       * 兜底（2026-10-10 22:18 CCTV13 线路一）：换壳档 15 秒还不出画就改重编。
+       *
+       * 「浏览器拒收我们的换壳产物」那个 bufferAddCodecError 不一定每次都能收到 ——
+       * 旧实例排队事件可能被丢弃、hls.js 也可能只是安静地建不出 SourceBuffer。
+       * 那一轮的现象就是：会话建好了、列表在涨、loadedmetadata 却始终 0×0，界面一直转圈。
+       * 所以不把成败押在那个错误上：只要还没出画（videoWidth 为 0）且用的是换壳档，
+       * 到点就直接改成视频重编，并把这条源记下来（下次第一次就用重编）。
+       */
+      if ((!state.ffmpegVideoMode || state.ffmpegVideoMode === 'copy')
+          && !state.transcodeRetryAt && ticks * 2.5 > 15 && !video.videoWidth) {
+        state.transcodeRetryAt = Date.now();
+        state.ffmpegVideoMode = 'transcode';
+        const curLine = state.lines[state.currentLine];
+        if (curLine && curLine.url) TRANSCODE_URLS.add(curLine.url);
+        diagPush('ffmpeg-status', '换壳档 15 秒未出画：改走视频重编（疑似浏览器不认源的 H.264 参数）', 'warn');
+        toastThrottled('换壳出来的画面浏览器解不了，改成重编（多花一点 CPU）…');
+        stopHealthCheck();
+        tryFfmpegFallback('换壳档未出画（疑似浏览器不认源的 H.264 参数）',
+          state.currentLine >= 0 ? state.currentLine : undefined, { video: 'transcode' }).catch(() => {});
+        return;
       }
     } catch (err) {
       /* 状态查询失败不影响播放，继续盯 */
@@ -2651,6 +2837,14 @@ function seekToLiveEdge(reason) {
   return true;
 }
 
+/**
+ * 「数据停供多久」才算真僵住。
+ *
+ * 这个值是整套卡顿处理的宽容度：在这段时间内只要缓冲末端还在长，就说明源还活着，
+ * 我们只等不动手。8 秒约等于这些源 1~2 个分片的节奏。
+ */
+const STALL_QUIET_MS = 8000;
+
 function startStallWatchdog() {
   stopStallWatchdog();
   let lastTime = -1;
@@ -2706,12 +2900,19 @@ function startStallWatchdog() {
      * 所以在这里兜一道：只要画面真的在动（上面 pictureSeen 已确认），
      * 不管走哪条路径，都把转圈提示收掉。每秒都在跑，最多多显示 1 秒。
      */
-    const sp = $('spinner');
-    if (sp && !sp.classList.contains('hidden')) {
-      setSpinner(false);
-      hideError();
-      renderLinePanel();
-    }
+    /*
+     * 画面在动，说明之前那个「播放失败」已经过时了 —— 无条件收起。
+     *
+     * 实测（2026-10-10 CCTV13）：旧实例的迟到 bufferIncompatibleCodecsError
+     * 在画面上弹了个「ffmpeg 转码播放失败」，而底下 CCTV13 明明在播，
+     * 那个面板再也没人收 —— 因为原来的收起条件要求 spinner 还挂着。
+     */
+    const spEl = $('spinner');
+    const errEl = $('errorBox');
+    const wasShowing = (spEl && !spEl.classList.contains('hidden')) || (errEl && !errEl.classList.contains('hidden'));
+    setSpinner(false);
+    hideError();
+    if (wasShowing) renderLinePanel();   // 只在真的收掉东西时才重绘面板，别每 2 秒刷一次
 
     if (Math.abs(v.currentTime - lastTime) < 0.05) stalls += 1;
     else stalls = 0;
@@ -2724,8 +2925,21 @@ function startStallWatchdog() {
      * 「离直播边缘」一路变大 —— 用户截图里就是这一组数字。
      * 它必须在这里拦下来，否则看门狗永远不触发，用户只能一直看幻灯片。
      */
-    const aheadNow = v.buffered.length
-      ? Math.max(0, v.buffered.end(v.buffered.length - 1) - v.currentTime) : 0;
+    const bufEndNow = v.buffered.length ? v.buffered.end(v.buffered.length - 1) : 0;
+    const aheadNow = Math.max(0, bufEndNow - v.currentTime);
+    /*
+     * 「数据还在不在来」的判据：缓冲末端有没有继续长。
+     *
+     * 这一条是整个卡顿处理的分水岭 —— 前向缓冲薄、但数据一直在来，是**慢源**，
+     * 等着就行（VLC / mpv / PotPlayer 全都这么干）；缓冲薄、而且连续几秒
+     * 一点新数据都没有，才叫**真僵住**，那才值得动手。
+     */
+    if (bufEndNow > (state.bufEndSeen || 0) + 0.05) {
+      state.bufEndSeen = bufEndNow;
+      state.lastDataAt = Date.now();
+    } else if (bufEndNow < (state.bufEndSeen || 0)) {
+      state.bufEndSeen = bufEndNow;   // MediaSource 重建 / 换台后缓冲重置
+    }
     if (checkStarvation(attempt, aheadNow)) {
       stalls = 0;
       return;
@@ -2762,16 +2976,37 @@ function startStallWatchdog() {
      * 只要前向缓冲已经见底（< 1.5 秒）就动手，不等它自己悟。
      */
     if (aheadNow < 1.5 && state.hls) {
-      state.loaderRescues = (state.loaderRescues || 0) + 1;
       /*
-       * 实测（2026-10-07 02:16 日志）：这个阶段 `startLoad()` **救不回来** ——
-       * 连做 3 次缓冲仍是 0.0s，而第 4 次改成「重建 MediaSource」后
-       * 一口气灌入 seg00005~15、buffered 立刻变成 9.4~21.4 并恢复播放。
-       * 所以别浪费三次机会：第 2 次起就直接重建。
+       * 前向缓冲见底 ≠ 播放器坏了（2026-10-10 重写）。
+       *
+       * hls.js 官方文档写得很直白：recoverMediaError()「Resets the MediaSource
+       * and restarts streaming from the last known playhead position. This should
+       * only be used when the media element is in an error state. It should not be
+       * used in response to non-fatal hls.js error events.」
+       * 而「缓冲见底」正是非致命状态。VLC / mpv / PotPlayer 在这种情况下的做法
+       * 只有两个字：**等**。数据一到接着播，时间轴不跳、缓冲不清。
+       *
+       * 实测（2026-10-10 21:46~21:48 现场日志）：旧逻辑在 3 分钟里重建了 9 次
+       * MediaSource，每次都是一次可见黑屏；而那条源一直在约 1× 产出 ——
+       * 是我们自己的「救援」把前向缓冲一次次数清零的（重建后播放头落在最新数据处，
+       * 前向缓冲只剩几秒，下一次抖动必然又见底，于是越救越糟）。
+       *
+       * 现在分三档：
+       *   ① 时间轴还在动（stalls === 0）→ 什么都不做，等源补数据；
+       *   ② 时间轴不动，但缓冲末端还在长（8 秒内来过数据）→ 也等；
+       *   ③ 时间轴不动、且连续 8 秒没有任何新数据 → 这才是真僵住：
+       *      先 startLoad()（hls.js 自己的低级重试），仍僵再 recoverMediaError()。
        */
+      const quietMs = Date.now() - (state.lastDataAt || 0);
+      if (stalls === 0) return;
+      if (quietMs < STALL_QUIET_MS) return;
+
+      state.loaderRescues = (state.loaderRescues || 0) + 1;
       const hard = state.loaderRescues >= 2;
-      diagPush('play', `缓冲见底（${aheadNow.toFixed(1)}s），${hard ? '重建 MediaSource（recoverMediaError）' : '救活加载器（startLoad）'}` +
-        `（第 ${state.loaderRescues} 次）`, state.loaderRescues > 6 ? 'warn' : 'ok');
+      diagPush('play', `真僵住（前向 ${aheadNow.toFixed(1)}s，${(quietMs / 1000).toFixed(0)}s 没有新数据），` +
+        `${hard ? '重建 MediaSource（recoverMediaError）' : '救活加载器（startLoad）'}（第 ${state.loaderRescues} 次）`,
+      state.loaderRescues > 6 ? 'warn' : 'ok');
+      state.lastDataAt = Date.now();
       /*
        * 顺手问一次服务端产出：卡顿现场能立刻分清是「ffmpeg 没写出来」还是
        * 「写了但客户端没取」。实测（02:16/02:18 日志）都是后者 ——
@@ -2791,10 +3026,10 @@ function startStallWatchdog() {
       }
       try {
         /*
-         * 实测结论：这个阶段的 `startLoad()` 基本救不回来（连做 3 次缓冲仍是 0.0s），
-         * 而 hls.js 官方的 recoverMediaError() 会**重建 MediaSource**、把僵住的
-         * 源缓冲整个换掉 —— 一改就立刻灌入 6~10 个分片并恢复播放。
-         * 所以第 2 次起直接重建，别浪费机会。
+         * 走到这里说明源**真的停供了**，那才是 hls.js 文档里说的 error 状态：
+         * 第一次先 startLoad()（最低干预，hls.js 自己会重新挂上加载），
+         * 第二次仍僵住才 recoverMediaError()（重建 MediaSource —— 有代价，
+         * 会黑一下，所以不再拿它当常规手段）。
          */
         if (hard) state.hls.recoverMediaError(); else state.hls.startLoad();
       } catch (err) { /* ignore */ }
@@ -2869,6 +3104,16 @@ function checkStarvation(attempt, ahead) {
    */
   const thinMs = (state.wantFfmpeg || state.ffmpegFallback) ? 20000 : 8000;
   if (now - (state.thinSince || now) < thinMs) return false;
+  /*
+   * 「薄」不等于「坏」（2026-10-10 补这道闸）。
+   *
+   * 只要缓冲末端还在长，这条线路就一直在交付数据 —— 慢归慢，它能一直播下去，
+   * 而这正是 VLC / PotPlayer 面对慢源时的表现。以前这里只看「缓冲低于 2 秒」
+   * 的时长，于是一条稳定但偏慢的线路会被判成「喂不满码率」直接拉黑换线，
+   * 面板上就出现一屏红色的「带宽不够 / 喂不满码率」。
+   * 现在要求源**真的停供**（连续 8 秒没有新数据）才走换线逻辑。
+   */
+  if (now - (state.lastDataAt || 0) < STALL_QUIET_MS) return false;
   state.thinSince = null;
 
   const { candidates, index } = attempt;
@@ -2955,6 +3200,13 @@ function destroyPlayer() {
   }
   state.attemptHandlers = [];
   stopStallWatchdog();
+  /*
+   * 实例序号自增：被销毁的 hls.js 实例还有排队中的事件（ERROR 尤其致命 ——
+   * 实测 2026-10-10 22:16 与 CCTV13 那次，迟到的 bufferAddCodecError /
+   * bufferIncompatibleCodecsError 把刚建好的会话又拆一次，或者直接在画面上
+   * 弹一个「播放失败」而底下画面其实在播）。所有事件回调都会先比对序号。
+   */
+  state.hlsSeq += 1;
   if (state.hls) {
     try { state.hls.destroy(); } catch (err) { /* ignore */ }
     state.hls = null;
@@ -3026,6 +3278,9 @@ async function playChannel(id) {
   state.wantFfmpeg = false;     // 换台/换频道都重新判定，别把上一个频道的结论带过来
   state.ffmpegTried = false;
   state.ffmpegFallback = false;
+  state.ffmpegVideoMode = 'copy';   // 视频先按「换壳」试，被浏览器拒了再重编（见下面的 CodecError 处理）
+  state.ffmpegHandoffAt = 0;
+  state.transcodeRetryAt = 0;
   state.lastFailReason = '';
   renderLinePanel();
 
@@ -3295,6 +3550,8 @@ async function startAttempt(candidates, engineQueue) {
 
   const tried = candidates.filter((i) => state.failures.has(i)).length;
   const line = state.lines[index];
+  // 记下地址：全部线路都失败时，「用外部播放器打开」要拿它去交给 PotPlayer/VLC/mpv
+  if (line && line.url) state.lastTriedUrl = line.url;
   state.currentLine = index;
   renderLinePanel();
   updateOsdLine(index);
@@ -3542,6 +3799,7 @@ async function startAttempt(candidates, engineQueue) {
     // 处于「猜」的状态（后面还有别的引擎要试）时把超时压短，
     // 否则要白等 20 秒才回退到 mpegts/flv
     const guessing = engines.length > 1;
+    const mySeq = ++state.hlsSeq;   // 这个实例的序号：被换掉之后，它的事件一律作废
     const hls = new window.Hls(makeHlsConfig({
       // 处于「猜」的状态（后面还有别的引擎要试）时把超时压短，
       // 否则要白等 20 秒才回退到 mpegts/flv
@@ -3552,6 +3810,7 @@ async function startAttempt(candidates, engineQueue) {
       fragLoadingTimeOut: 30000,
     }, state.livePlan));
     hls.on(window.Hls.Events.ERROR, (_evt, data) => {
+      if (state.hlsSeq !== mySeq) return;   // 旧实例的迟到事件：忽略
       if (state.playToken !== token) return;
       if (!data.fatal) return;
       const detail = String(data.details || data.type || '未知错误');
@@ -3575,9 +3834,89 @@ async function startAttempt(candidates, engineQueue) {
          * 停下加载了。这些源的分片窗口只有 15~25 秒，缓冲见底 / 出现空洞是常态，
          * 必须真的动手 —— 先跳空洞，再跳回直播边缘，都不行就让它从直播边缘重新加载。
          */
-        if (!recoverFromBufferHole() && !seekToLiveEdge('缓冲见底')) {
+        /*
+         * 注意这里**不再** seekToLiveEdge('缓冲见底')：跳回直播边缘会把辛苦攒下的
+         * 前向缓冲一次丢掉（播放头落到最新数据处，缓冲立刻只剩几秒），
+         * 下一次抖动必然又见底 —— 现场日志里那个「重建 → 缓冲归零 → 再重建」
+         * 的死循环就是这么来的。只有缓冲里真有空洞时才跳（recoverFromBufferHole），
+         * 其余情况交给 hls.js 自己重挂加载 + 上面的看门狗。
+         */
+        if (!recoverFromBufferHole()) {
           try { hls.startLoad(); } catch (err) { /* ignore */ }
         }
+        return;
+      }
+
+      /*
+       * bufferAddCodecError：hls.js 连 SourceBuffer 都建不起来。
+       *
+       * 这不是「线路坏了」，而是**这条流的编码 Chromium 不认** —— 实测就是
+       * MP2 / AC-3 音频、HEVC 视频这类；编码探测没覆盖到的时候就会走到这里。
+       * 以前它掉进下面的 failNextEngine → 这条线路被永久标成
+       * 「已失败: bufferAddCodecError」，然后去试下一条 —— 而下一条常常是
+       * 同一个源，一样建不起 SourceBuffer，于是整屏线路一条条变红。
+       *
+       * 正确的出路是交给内置 ffmpeg 换壳/转码（这正是这个应用存在的意义）：
+       * 拿**当前这条**线路去接管，而不是换线。
+       */
+      if (/bufferAddCodecError|manifestIncompatibleCodecsError/i.test(detail)) {
+        /*
+         * ⚠️ 这个错误可能来自**已经被销毁的旧 hls.js 实例**（迟到事件）。
+         *
+         * 实测（2026-10-10 22:16:26~28，线路一）：第一次 `bufferAddCodecError` 触发接管、
+         * 会话 2c57d7… 建好、正在「起播等待」；2 秒后同一批迟到事件又来一次，
+         * 于是刚建好的会话被拆掉、又建一个（1e47ca5b…），再等一次 20 秒 ——
+         * 连着拆了两次，画面一次都没起来。用户看到的就是「线路一又不行了」。
+         *
+         * 所以：只要**已经在 ffmpeg 路径上**（有会话 / 已标记兜底），这类报错一律忽略；
+         * 而且无论走不走接管，都绝不让它落到下面的 failNextEngine（那会把线路拉黑）。
+         */
+        /*
+         * 防抖但**不能锁死**（2026-10-10 22:19 的教训）：接管后 15 秒内的重复报错忽略
+         * （那是被销毁的旧实例排队里的重复事件），过期之后必须允许再试 ——
+         * 一刀切的永久忽略会让「一次没成的接管」变成永远转圈。
+         */
+        const sinceHandoff = Date.now() - (state.ffmpegHandoffAt || 0);
+        if (state.remuxSid && sinceHandoff < 15000) {
+          diagPush('play', `忽略接管的重复报错 ${detail}（接管后 ${(sinceHandoff / 1000).toFixed(1)}s）`, 'warn');
+          return;
+        }
+        if (!state.wantFfmpeg) {
+          state.wantFfmpeg = true;
+          state.ffmpegHandoffAt = Date.now();
+          state.ffmpegTried = true;
+          diagPush('play', `编码不支持（${detail}）：改走 ffmpeg 接管，线路${index + 1}`, 'warn');
+          toastThrottled('这条流的编码 Chromium 解不了，正在交给内置 ffmpeg…');
+          destroyPlayer();
+          tryFfmpegFallback('Chromium 没有这条流的解码器', index).then((ok) => {
+            if (state.playToken !== token) return;
+            if (!ok) {
+              // ffmpeg 也没起来：退回原来的「换下一条线路」逻辑
+              state.wantFfmpeg = false;
+              state.ffmpegTried = false;
+              failNextEngine(detail);
+              return;
+            }
+            /*
+             * 这条 return 绕过了 startAttempt 下面那整套保护，必须自己挂上：
+             * activeAttempt 缺了的话，卡顿看门狗从第一秒起就是空转的。
+             */
+            state.currentLine = index;
+            state.activeAttempt = { candidates, index, token };
+            startStallWatchdog();
+            armFallbackWatchdog(token);
+            armDecodeWatchdog(token, { ffmpegMode: true });
+            diagPush('play', `转码档保护已挂上：activeAttempt=线路${index + 1}`, 'ok');
+          }).catch(() => {
+            if (state.playToken !== token) return;
+            state.wantFfmpeg = false;
+            state.ffmpegTried = false;
+            state.ffmpegHandoffAt = 0;
+            failNextEngine(detail);
+          });
+          return;
+        }
+        // 已经在兜底流程里（wantFfmpeg=true）：既不重复接管，也不拉黑线路
         return;
       }
 
@@ -3587,9 +3926,27 @@ async function startAttempt(candidates, engineQueue) {
        * 而且重试期间播放点还在继续落后，所以直接跳到直播边缘去要新的分片。
        */
       const status = data.response && data.response.code;
-      if (/fragLoadError/i.test(detail) && (status === 404 || status === 410)) {
-        if (!seekToLiveEdge('分片已被上游删除')) {
-          toastThrottled('分片已被上游删除，正在重试…');
+      /*
+       * 分片取不到：404/410 是「这个分片已经被上游删了」；403 常见于中转源对
+       * 某个具体分片临时拒绝 —— 实测 192.168.1.10:19105 那条 relay：清单正常、
+       * 一部分分片 403；本机用同一条 ffmpeg 命令单独跑，它报
+       * 「failed too many times, skipping」跳过去继续出片（照样有画面）。
+       *
+       * 所以这类**不是「线路坏了」**：原地重试没意义（分片已经不在窗口里），
+       * 跳到直播边缘要新的分片才对；跳的次数由 seekToLiveEdge 自己封顶。
+       * 以前只有 404/410 走这条路，403 直接掉进「拉黑换线」，
+       * 面板上就留下一条「已失败: fragLoadError」——而那条线其实还能看。
+       */
+      if (/fragLoadError/i.test(detail) && status >= 400 && status < 500) {
+        if (seekToLiveEdge(`分片被上游拒绝（HTTP ${status}）`)) {
+          toastThrottled(`分片被上游拒绝（HTTP ${status}），已跳到直播边缘重试`);
+        } else {
+          /*
+           * 跳不动了（state.edgeSeeks 用尽）→ 这条线路确实不能用。
+           * 这里必须交给换线逻辑：只 toast 不换线的话，遇到一条永远 403 的线
+           * 就会原地打转，看起来就是「什么都不播」。
+           */
+          failNextEngine(`分片持续被拒（HTTP ${status}）`);
         }
         return;
       }

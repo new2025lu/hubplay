@@ -136,6 +136,23 @@ function networkInputArgs(url, ref, ua) {
     '-readrate_initial_burst', '30',
     '-readrate_catchup', '5',
   );
+  /*
+   * ⚡ 分片地址没有扩展名时，ffmpeg 默认会拒收**整条流**（2026-10-10 实测）。
+   *
+   * ysp-live 这类中转源把分片包成 /cctv1/segment/<base64>，地址结尾没有 .ts。
+   * ffmpeg 的 hls 解复用器有两道扩展名检查：
+   *   1. allowed_segment_extensions —— 白名单，不在名单里直接拒绝；
+   *   2. extension_picky —— 嗅探出的格式与地址后缀对不上时也拒绝，报
+   *      「detected format mpegts extension none mismatches allowed extensions in url」。
+   *
+   * 本机 ffprobe 实测（同一条线路）：
+   *   - 只加 -allowed_segment_extensions ALL → 仍然失败（卡在第 2 道）
+   *   - 加 -extension_picky 0                → 读到 stream,aac,audio / stream,h264,video ✓
+   *
+   * 这就是「PotPlayer / VLC 能播、我们的 ffmpeg 却说『不是有效视频』」的答案：
+   * 它们不查这个后缀，ffmpeg 默认查。两条都是**输入级**选项，必须写在 -i 之前。
+   */
+  args.push('-allowed_segment_extensions', 'ALL', '-extension_picky', '0');
   const lines = [];
   if (ref) lines.push(`Referer: ${ref}`);
   if (ua) lines.push(`User-Agent: ${ua}`);
@@ -179,10 +196,34 @@ async function probe(file, inputArgs = null) {
   return info;
 }
 
+/**
+ * ffprobe 用的输入参数。
+ *
+ * ⚠️ `-readrate` / `-readrate_initial_burst` / `-readrate_catchup` 是 **ffmpeg CLI 自己的
+ * 输入选项**（在 fftools 里，不在 libavformat 里），ffprobe 根本不存在这些选项 ——
+ * 混在一起传过去，ffprobe 第一句就报
+ *   Failed to set value '1' for option 'readrate': Option not found
+ * 于是一直退到下面的 ffmpeg 回退路径。实测（2026-10-10）：
+ *   · `ffprobe ... -readrate 1 ... -i <m3u8>` → 直接失败；
+ *   · 去掉这三条 → 正常读出 stream,aac,audio / stream,h264,video。
+ * 而回退路径拿到的是不带输入参数的裸 `-i`，遇到「分片地址没有扩展名」的源
+ * （ysp-live 那种 /segment/<base64>）又会被扩展名检查拒掉 —— 两头都失败，
+ * 于是界面显示「无法解析这个文件（不是有效视频？）」，线路一被白白判成播不了。
+ */
+function probeInputArgs(inputArgs) {
+  const drop = new Set(['-readrate', '-readrate_initial_burst', '-readrate_catchup']);
+  const out = [];
+  for (let i = 0; i < (inputArgs || []).length; i += 1) {
+    if (drop.has(inputArgs[i])) { i += 1; continue; }   // 连它的值一起跳过
+    out.push(inputArgs[i]);
+  }
+  return out;
+}
+
 async function probeUncached(file, inputArgs = null) {
   const r = await runCapture(FFPROBE, [
     '-v', 'error', '-print_format', 'json', '-show_format', '-show_streams',
-    ...(inputArgs || [file]),
+    ...probeInputArgs(inputArgs && inputArgs.length ? inputArgs : ['-i', file]),
   ]);
   if (r.stdout && r.stdout.trim().startsWith('{')) {
     let d;
@@ -208,8 +249,13 @@ async function probeUncached(file, inputArgs = null) {
     }
   }
 
-  // 退路：解析 ffmpeg -i
-  const f = await runCapture(FFMPEG, ['-hide_banner', '-i', file], 20000);
+  // 退路：解析 ffmpeg -i。这里同样要带输入参数 —— 否则「分片地址没有扩展名」
+  // 的源在退路上也会被扩展名检查拒掉（线路一就是这么两头都失败的）。
+  const f = await runCapture(
+    FFMPEG,
+    ['-hide_banner', '-loglevel', 'info', ...probeInputArgs(inputArgs && inputArgs.length ? inputArgs : ['-i', file])],
+    20000
+  );
   const text = f.stderr || '';
   const vm = text.match(/Stream #\d+:\d+.*?: Video: (\w+)/);
   const am = text.match(/Stream #\d+:\d+.*?: Audio: (\w+)/);
@@ -228,12 +274,19 @@ async function probeUncached(file, inputArgs = null) {
   };
 }
 
-function decide(info, file) {
+function decide(info, file, caps) {
   const ext = path.extname(file).slice(1).toLowerCase();
   const v = info.video ? info.video.codec : null;
   const a = info.audio ? info.audio.codec : null;
   const containerOk = BROWSER_CONTAINER.has(ext) || BROWSER_CONTAINER.has(info.format);
-  const videoOk = !v || BROWSER_VIDEO.has(v);
+  /*
+   * HEVC（H.265）要看机器：Windows 上 Chromium 只有拿到平台 HEVC 硬解时才能解，
+   * 所以白名单里默认没有它。但前端启动时会用 mediaCapabilities 探测一次
+   * （state.decodeCap.hevc_1080），探到支持就把结论带过来 —— 否则每一路 HEVC 频道
+   * 都会白白走一遍转码（实测这台机器 MSE/hev1 = true，属于能直通的那类）。
+   */
+  const hevcOk = !!(caps && caps.hevc) && (v === 'hevc' || v === 'h265');
+  const videoOk = !v || BROWSER_VIDEO.has(v) || hevcOk;
   const audioOk = !a || BROWSER_AUDIO.has(a);
 
   if (containerOk && videoOk && audioOk) {
@@ -300,12 +353,12 @@ async function closeAll() {
  * HEVC、AC-3/MP2 音频、非标准 TS 封装等等。ffmpeg 直接按 URL 拉流，
  * 再输出成 H.264+AAC 的 HLS，Chromium 就能播了——等同于把 MPV/VLC 的解码能力搬进应用。
  */
-async function openStream({ url, ref, ua, name }) {
+async function openStream({ url, ref, ua, name, videoMode, caps }) {
   if (!/^https?:\/\//i.test(url)) throw new Error('地址不合法');
   const inputArgs = networkInputArgs(url, ref, ua);
   const info = await probe(url, inputArgs);
   if (!info.ok) throw new Error(info.error || '拉流失败');
-  const plan = decide(info, name || url);
+  const plan = decide(info, name || url, caps);
 
   await sweep();
   const id = newId();
@@ -327,6 +380,19 @@ async function openStream({ url, ref, ua, name }) {
     finished: false,
     error: '',
     touchedAt: Date.now(),
+    /*
+     * 视频怎么处理：'copy'（默认，换壳）还是 'transcode'（真正重编）。
+     *
+     * 为什么要这个开关：有些源的 H.264 码流 SPS 里带着 MSE 不认的 constraint 位 ——
+     * 实测（2026-10-10）浏览器报的 mime 是 `avc1.640128`，而
+     * MediaSource.isTypeSupported('video/mp4;codecs="avc1.640128"') = false，
+     * 同一档次换成 'avc1.640028' / 'avc1.64001f' 就是 true（差别只在第二个字节）。
+     * `-c:v copy` 会把这个 SPS 原样搬进输出，于是 ffmpeg 做得再对、播放器也建不起
+     * SourceBuffer。此时唯一的出路是**真编一遍**：libx264 产出的 SPS 是浏览器认的那种。
+     * 谁来决定：前端 —— 它手上有浏览器返回的真实 mime（见 renderer/app.js 的
+     * bufferAddCodecError 处理），先试 copy，被拒了再带 video:'transcode' 重来一次。
+     */
+    videoMode: videoMode === 'transcode' ? 'transcode' : 'copy',
     network: { url, ref: ref || '', ua: ua || '', inputArgs },
   };
   sessions.set(id, session);
@@ -334,7 +400,7 @@ async function openStream({ url, ref, ua, name }) {
 }
 
 /** 为一个本地文件建会话：探测 + 定档，真正的 ffmpeg 等第一次请求播放列表时才起。 */
-async function openFile(file) {
+async function openFile(file, caps) {
   let stat;
   try {
     stat = await fsp.stat(file);
@@ -345,7 +411,7 @@ async function openFile(file) {
 
   const info = await probe(file);
   if (!info.ok) throw new Error(info.error || '探测失败');
-  const plan = decide(info, file);
+  const plan = decide(info, file, caps);
 
   await sweep();
   const id = newId();
@@ -371,9 +437,33 @@ async function openFile(file) {
 }
 
 function ffmpegArgs(session) {
+  /*
+   * 会不会走到「重编」档 —— 决定要不要给解码上硬件加速。
+   *
+   * 这个包里的 ffmpeg 带了 mpeg2_qsv / hevc_amf / h264_amf / h264_qsv 等硬件解码器，
+   * 这台机器又是 AMD RX590 + Intel UHD：转码时把**解码**放到 GPU 上，CPU 只负责编码，
+   * 占用能明显下来（用户抱怨的「转码时卡」多半就来自软件解码抢 CPU）。
+   *
+   * 只在转码档插 `-hwaccel auto`：
+   *   · 换壳档是 `-c:v copy`，解码根本用不上；
+   *   · 而且它必须写在 `-i` 之前 —— `-hwaccel` 是**输入级**选项，
+   *     和 `-readrate` 一样，绝不能混进喂给 ffprobe 的那份参数里（1.6.11 踩过）。
+   * 所以这里复制一份 input 再插，不动 session.network.inputArgs 本体。
+   */
+  const willTranscode = session.tier !== 'remux'
+    || session.videoMode === 'transcode'
+    || !!(session.info && session.info.video && session.info.video.codec
+      && session.info.video.codec !== 'h264');
   const input = session.network
-    ? session.network.inputArgs
+    ? session.network.inputArgs.slice()
     : ['-i', session.file];
+  if (willTranscode && session.hwaccel !== false) {
+    const at = input.indexOf('-i');
+    if (at >= 0) {
+      input.splice(at, 0, '-hwaccel', 'auto');
+      session.hwaccelUsed = true;
+    }
+  }
   const base = [
     '-hide_banner', '-loglevel', 'error', '-y', ...input,
     /*
@@ -509,9 +599,29 @@ function ffmpegArgs(session) {
     if (videoCodec && videoCodec !== 'h264') {
       return [...base, ...ENC_V, ...ENC_A, ...hls];
     }
+    // 源是 H.264，但浏览器拒收它的 SPS（见 openStream 里 videoMode 的注释）→ 真编一遍
+    if (session.videoMode === 'transcode') {
+      return [...base, ...ENC_V, ...ENC_A, ...hls];
+    }
     const audioOk = !audioCodec || BROWSER_AUDIO.has(audioCodec);
     // 视频直通；音频能直通就直通，否则只转音频（很便宜）
-    return [...base, '-c:v', 'copy', ...(audioOk ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '128k']), ...hls];
+    /*
+     * 音频一律重编成 AAC，不做 `-c:a copy`（2026-10-10 实测踩坑）。
+     *
+     * 起因：线路一 / 线路四的源是 H.264 + **ADTS AAC**，判活时 audioOk=true，
+     * 于是走了 `-c:a copy`。而 fMP4 容器不收 ADTS 形式的 AAC —— ffmpeg 直接
+     * 报「use the audio bitstream filter 'aac_adtstoasc' to fix it」并退出，
+     * 会话体检里留下的就是 `Error writing trailer: Operation not permitted`，
+     * 界面表现为「ffmpeg 接管失败」，线路被标红。
+     *
+     * 三条路里选了最稳的一条：
+     *   · 加 `-bsf:a aac_adtstoasc` —— 只治 AAC，别的容器/位流组合还会踩；
+     *   · 先 copy 失败再重试 —— 多一次失败与重试，直播起播时间要不起；
+     *   · **一律重编 AAC**（本行）—— 128k 立体声对 CPU 是零头，
+     *     而它一次性覆盖 MP2 / AC-3 / ADTS-AAC / LATM-AAC 全部情况。
+     * 视频仍然是 `-c:v copy`，真正吃 CPU 的那部分一点没多。
+     */
+    return [...base, '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-ac', '2', ...hls];
   }
 
   // 转码：MPEG-2 / HEVC / AV1 这类 Chromium 没有解码器的视频
@@ -546,6 +656,27 @@ function startTranscode(session) {
     // 退出码即使是 0 也留个底：直播流被上游掐断时我们也要知道
     session.exitCode = code;
     if (code !== 0) session.error = `ffmpeg 退出码 ${code}：${stderr.trim().split('\n').pop() || ''}`;
+    /*
+     * 硬件解码在这台机器上不成立时（驱动/运行时缺失），ffmpeg 会在**启动阶段**就退出。
+     * 这种情况不能把整条线路判死 —— 去掉 -hwaccel 再来一次就是了。
+     * 判据压得很紧：必须用过 -hwaccel、只重试一次、且确实是启动就失败（没产出任何分片）。
+     */
+    if (code !== 0 && session.hwaccelUsed && !session.hwaccelRetried) {
+      session.hwaccelRetried = true;
+      session.hwaccelUsed = false;
+      session.hwaccel = false;      // 下一次 ffmpegArgs() 不再插 -hwaccel
+      session.error = '';
+      session.finished = false;
+      session.started = false;
+      fsp.readdir(session.dir).then((names) => Promise.all(names
+        .filter((n) => /^(seg\d+\.m4s|init\.mp4|index\.m3u8.*)$/.test(n))
+        .map((n) => fsp.rm(path.join(session.dir, n), { force: true }))))
+        .catch(() => {})
+        .then(() => {
+          session.stderr = '';
+          startTranscode(session);   // 这次不带 -hwaccel
+        });
+    }
   });
 }
 
@@ -571,10 +702,16 @@ async function sessionStatus(session) {
     segments: 0,
     mediaSequence: null,
     firstSegment: null,
+    // 播放列表最后更新时间距今多久。ffmpeg 靠「写 .tmp → 改名」重写列表，
+    // 只要改名被别的句柄挡住，这里就会一直变大而分片数不动 —— 那是
+    // 「转圈但分片在涨」这类故障的唯一读数，日志里必须留痕。
+    playlistAgeMs: null,
     stderrTail: (session.stderr || '').trim().split('\n').slice(-6).join('\n'),
   };
   try {
-    const text = await fsp.readFile(path.join(session.dir, 'index.m3u8'), 'utf8');
+    const listPath = path.join(session.dir, 'index.m3u8');
+    out.playlistAgeMs = Date.now() - (await fsp.stat(listPath)).mtimeMs;
+    const text = await fsp.readFile(listPath, 'utf8');
     const segs = text.split(/\r?\n/).filter((l) => l && !l.startsWith('#'));
     out.segments = segs.length;
     out.firstSegment = segs[0] || null;

@@ -18,7 +18,7 @@
  * 用法：
  *   node tools/codec_route_check.js
  *   SOURCE=http://127.0.0.1:18787  node tools/codec_route_check.js
- *   URL=http://110.72.78.112:808/hls/106/index.m3u8 node tools/codec_route_check.js
+ *   URL=http://203.0.113.10:808/hls/106/index.m3u8 node tools/codec_route_check.js
  *
  * 注意：默认那几条 MPEG-2 测试线路是**外部源**，网络不通时会跳过而不是判失败。
  */
@@ -130,7 +130,7 @@ const record = (name, ok, note) => {
 
 /** 默认测试线路：第一条确认是 MPEG-2/MP2，第二条是 H.264/AAC。 */
 const DEFAULT_LINES = {
-  mpeg2: process.env.URL_MPEG2 || 'http://110.72.78.112:808/hls/106/index.m3u8',
+  mpeg2: process.env.URL_MPEG2 || 'http://203.0.113.10:808/hls/106/index.m3u8',
   h264: process.env.URL_H264 || 'http://example.com/live/h264.m3u8',
 };
 

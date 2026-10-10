@@ -37,7 +37,7 @@ HubPlay 随包带一份 ffmpeg，遇到这类源就自动转成 H.264 + AAC 的 
 
 ## 快速开始（直接下载可运行版）
 
-1. 从 [Releases](https://github.com/new2025lu/hubplay/releases) 下载 `HubPlay-1.6.6-win-x64.zip`。
+1. 从 [Releases](https://github.com/new2025lu/hubplay/releases) 下载 `HubPlay-1.6.27-win-x64.zip`。
 2. 解压到任意目录（**不要放在需要管理员权限的位置**，例如 `C:\Program Files` 根下）。
 3. 双击 `HubPlay.exe`。
 4. 顶栏粘贴源地址，点「导入」。
