@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HubPlay</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app">
+
+  <header class="topbar">
+    <button id="btnSidebar" class="btn btn-icon" title="隐藏 / 显示频道列表 (B)">
+      <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+        <rect x="3" y="4.5" width="18" height="15" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/>
+        <path d="M9.5 4.5v15" stroke="currentColor" stroke-width="1.8"/>
+      </svg>
+    </button>
+
+    <div class="brand">
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+        <defs>
+          <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#667eea"/>
+            <stop offset="100%" stop-color="#764ba2"/>
+          </linearGradient>
+        </defs>
+        <rect x="1.5" y="3" width="21" height="14" rx="2.5" fill="url(#bg)"/>
+        <rect x="4" y="5.5" width="16" height="9" rx="1" fill="#0a0a0f"/>
+        <path d="M10 8.2v3.6l3.2-1.8z" fill="#fff"/>
+        <path d="M8 20h8" stroke="#667eea" stroke-width="1.8" stroke-linecap="round"/>
+      </svg>
+      <span>HubPlay</span>
+    </div>
+
+    <input id="srcInput" class="src-input" type="text" spellcheck="false"
+           placeholder="粘贴源地址：iptv-hub 地址（如 http://192.168.1.10:18787）或 M3U / TXT 链接">
+
+    <button id="btnOpenFile" class="btn" title="打开本地视频文件（也可以直接把文件拖进来）">📂 打开</button>
+    <button id="btnPlay" class="btn btn-primary" title="导入并播放第一个频道">播放</button>
+    <button id="btnImport" class="btn" title="只导入频道列表">导入</button>
+    <button id="btnFavOnly" class="btn btn-ghost" title="只看收藏">★ 收藏</button>
+    <button id="btnClear" class="btn btn-danger" title="清空当前列表">清空</button>
+
+    <div id="status" class="status" title="">
+      <span id="statusDot" class="dot"></span>
+      <span id="statusText">未连接</span>
+    </div>
+  </header>
+
+  <main class="body">
+    <div class="sidebar-handle" aria-hidden="true"></div>
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <h2>频道列表</h2>
+        <span id="syncBadge" class="badge badge-idle">未加载</span>
+      </div>
+
+      <div id="groupChips" class="chips"></div>
+
+      <input id="search" class="search" type="search" spellcheck="false" placeholder="搜索频道（Ctrl+F 或 /）">
+
+      <div id="channelList" class="channels"></div>
+
+      <div class="sidebar-foot">
+        <span id="countLabel">0 个频道</span>
+        <span id="hubLabel" class="hub-label"></span>
+      </div>
+    </aside>
+
+    <section class="stage">
+      <video id="video" playsinline webkit-playsinline></video>
+
+      <div id="placeholder" class="placeholder">
+        <svg viewBox="0 0 24 24" width="76" height="76" aria-hidden="true">
+          <rect x="2" y="4" width="20" height="13" rx="2.5" fill="none" stroke="#3a3a52" stroke-width="1.4"/>
+          <path d="M10 8.5v4.5l4-2.25z" fill="#3a3a52"/>
+          <path d="M8 20.5h8" stroke="#3a3a52" stroke-width="1.4" stroke-linecap="round"/>
+        </svg>
+        <p id="placeholderText">粘贴源地址后点「导入」，或直接点「播放」</p>
+        <p class="placeholder-hint">也可以从左侧频道列表里选一个频道</p>
+      </div>
+
+      <div id="spinner" class="spinner hidden"><div class="ring"></div><span id="spinnerText">加载中…</span></div>
+
+      <div id="osd" class="osd hidden">
+        <div class="osd-title" id="osdTitle"></div>
+        <div class="osd-sub" id="osdSub"></div>
+      </div>
+
+      <div id="dropMask" class="drop-mask hidden">
+        <div class="drop-inner">
+          <svg viewBox="0 0 24 24" width="58" height="58" aria-hidden="true">
+            <path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5" stroke="#8fa2ff" stroke-width="1.8"
+                  fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M4 16v2.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V16"
+                  stroke="#8fa2ff" stroke-width="1.8" fill="none" stroke-linecap="round"/>
+          </svg>
+          <p>松手即播放</p>
+          <p class="drop-hint">支持 mp4 / mkv / avi / wmv / flv / ts / rmvb 等，不支持的会自动转码</p>
+        </div>
+      </div>
+
+      <div id="errorBox" class="error-box hidden">
+        <div class="error-title" id="errorTitle"></div>
+        <div class="error-body" id="errorBody"></div>
+      </div>
+
+      <div id="controls" class="controls hidden">
+        <button id="btnPrev" class="ctrl" title="上一个频道 (↑)">⏮</button>
+        <button id="btnToggle" class="ctrl" title="播放 / 暂停 (空格)">⏸</button>
+        <button id="btnNext" class="ctrl" title="下一个频道 (↓)">⏭</button>
+
+        <div class="volume">
+          <button id="btnMute" class="ctrl" title="静音 (M)">🔊</button>
+          <input id="volume" class="volume-range" type="range" min="0" max="1" step="0.01" value="1">
+        </div>
+
+        <div class="live-tag" id="liveTag">直播</div>
+
+        <input id="seek" class="seek" type="range" min="0" max="1000" step="1" value="0" title="拖动进度">
+        <span id="timeLabel" class="time-label">--:-- / --:--</span>
+
+        <div class="now" id="nowPlaying"></div>
+
+        <label class="buf-pick" title="缓冲档位。注意：这些源的分片列表只有 15~25 秒，缓冲超过窗口长度就会去要已被上游删掉的分片，反而更卡。所以实际缓冲深度会按源窗口自动收窄。">
+          <span>缓冲</span>
+          <select id="bufferSel">
+            <option value="low">追直播</option>
+            <option value="balanced">平衡</option>
+            <option value="stable">抗抖动</option>
+          </select>
+        </label>
+        <label class="buf-pick" title="视频解码方式。自动＝有独显先用独显硬解，没有独显用核显，都不行才用 CPU 软解。改动会重启应用（命令行开关只能启动时生效）。">
+          <span>解码</span>
+          <select id="decodeSel">
+            <option value="auto">自动（独显→核显→软解）</option>
+            <option value="discrete">独显优先</option>
+            <option value="integrated">核显</option>
+            <option value="software">软件解码</option>
+          </select>
+        </label>
+        <button id="btnLines" class="ctrl ctrl-wide" title="切换线路">线路</button>
+        <button id="btnStats" class="ctrl" title="播放统计 (I)：判断卡顿是缓冲不够还是解码跟不上">📊</button>
+        <button id="btnFull" class="ctrl" title="全屏 (F)">⛶</button>
+      </div>
+
+      <div id="linePanel" class="line-panel hidden"></div>
+
+      <div id="statsPanel" class="stats-panel hidden">
+        <div class="stats-head">播放统计 <span class="stats-hint">按 I 关闭</span></div>
+        <table id="statsBody"></table>
+        <div id="statsVerdict" class="stats-verdict"></div>
+      </div>
+
+      <!--
+        诊断日志面板（按 L 开关）。
+        用途：播放出问题时，把 hls.js 的事件流水、video 元素事件、失败判定
+        全部记下来，点「复制」就能整段发回来 —— 比「我这边播不了」有用得多。
+      -->
+      <div id="diagPanel" class="stats-panel diag-panel hidden">
+        <div class="stats-head">
+          播放诊断日志 <span class="stats-hint">按 L 关闭</span>
+          <button id="btnDiagCopy" class="ctrl" title="复制全部日志">复制</button>
+          <button id="btnDiagClear" class="ctrl" title="清空日志">清空</button>
+        </div>
+        <pre id="diagLog" class="diag-log"></pre>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/vendor/hls.min.js"></script>
+<script src="/vendor/mpegts.js"></script>
+<script src="/vendor/flv.min.js"></script>
+<script src="/livewin.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

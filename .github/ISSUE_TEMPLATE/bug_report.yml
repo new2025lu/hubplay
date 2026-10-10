@@ -1,0 +1,41 @@
+name: 问题反馈
+description: 播放异常、界面异常等
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请尽量附上界面按 `L` 导出的诊断日志（记得先把真实源地址隐去）。
+  - type: input
+    id: version
+    attributes:
+      label: HubPlay 版本
+      description: 界面标题或「关于」里显示的值
+      placeholder: 1.6.6
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: 系统与显卡
+      placeholder: Windows 11 23H2 / AMD RX590
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: 现象与复现步骤
+      placeholder: |
+        1. 导入源后点击 CCTV13
+        2. 一直转圈，错误面板显示……
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: 诊断日志
+      description: 界面按 L → 复制（源地址请替换为 example.com）
+      render: text
+    validations:
+      required: false

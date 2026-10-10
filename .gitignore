@@ -1,0 +1,11 @@
+node_modules/
+dist/
+vendor-win/
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# 打包/构建产物
+/out/
+/release/

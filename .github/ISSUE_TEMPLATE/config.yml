@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 使用问题 / 讨论
+    url: https://github.com/new2025lu/hubplay/discussions
+    about: 使用方式、源格式、环境相关问题请走讨论区
